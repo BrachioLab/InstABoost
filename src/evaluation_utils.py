@@ -72,6 +72,12 @@ def bootstrap_confidence_interval(
     """
     # Convert to numpy array
     data_array = np.array(data)
+
+    if data_array.size == 0:
+        return (0.0, 0.0)
+    if data_array.size == 1:
+        value = float(data_array[0])
+        return (value, value)
     
     # Calculate confidence interval using scipy
     bootstrap_result = stats.bootstrap(

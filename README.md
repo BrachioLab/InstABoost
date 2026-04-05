@@ -12,10 +12,12 @@ Authors: Vitoria Guardieiro\*, Adam Stein\*, Avishree Khare\*, Eric Wong
 
 The experiments are designed to be run within a Docker container. We use the `pytorch/pytorch:2.6.0-cuda12.6-cudnn9-devel` image. Install `git` in your container.
 
-Install python dependencies with:
+Create the local virtual environment and install the repo dependencies with:
 ```
-pip install -r requirements.txt
+scripts/setup_local_env.sh
 ```
+
+The Docker image already provides the CUDA-enabled PyTorch build used by the experiments, so `requirements.txt` intentionally does not pin a separate `torch` wheel.
 
 Then, you need to set environment variables with your Huggingface token (for running experiments with gated models), your Google API key (for llm-judge), and Perspective API key (to evaluate generation toxicity).
 
@@ -51,6 +53,18 @@ python src/steering.py \
 ```
 
 We also provide scripts to run all methods on each dataset on the folder `scripts`. 
+
+For the prompt-only emotions runs used by the newer multi-model workflow, you can run:
+```
+bash scripts/run_emotions_prompt_methods_models.sh joy
+```
+
+To run the same workflow for all six emotions:
+```
+bash scripts/run_emotions_prompt_methods_models.sh all
+```
+
+For `openai/gpt-oss-20b`, the repo now follows the TransformerLens GPT-OSS demo approach and loads directly from the cached safetensors shards, dequantizing expert weights on CPU before moving the model to GPU.
 
 ### Step 3: Aggregate results and generate figures
 

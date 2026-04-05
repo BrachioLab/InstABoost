@@ -1,5 +1,6 @@
 import os
 import gc
+import re
 from typing import List, Callable, Tuple
 
 import torch
@@ -8,9 +9,50 @@ import numpy as np
 from tqdm import tqdm
 from jaxtyping import Int
 
-from transformer_lens import HookedTransformer
+from transformer_lens import HookedTransformer, utils
 from transformer_lens.hook_points import HookPoint
+from transformer_lens.past_key_value_caching import HookedTransformerKeyValueCache
 from transformers import AutoTokenizer
+
+
+def _get_stop_token_ids(model: HookedTransformer) -> set[int]:
+    stop_token_ids = getattr(model, "generation_stop_token_ids", None)
+    if stop_token_ids is None:
+        stop_token_ids = [model.tokenizer.eos_token_id]
+    if isinstance(stop_token_ids, int):
+        stop_token_ids = [stop_token_ids]
+    return {int(token_id) for token_id in stop_token_ids if token_id is not None}
+
+
+def _parse_gpt_oss_final_response(text: str) -> str:
+    matches = re.findall(
+        r"<\|channel\|>final<\|message\|>(.*?)(?:<\|end\|>|<\|return\|>|<\|start\|>|$)",
+        text,
+        flags=re.DOTALL,
+    )
+    if matches:
+        return matches[-1].strip()
+
+    commentary_matches = re.findall(
+        r"<\|channel\|>commentary<\|message\|>(.*?)(?:<\|end\|>|<\|return\|>|<\|start\|>|$)",
+        text,
+        flags=re.DOTALL,
+    )
+    if commentary_matches:
+        return commentary_matches[-1].strip()
+
+    cleaned = re.sub(r"<\|[^>]+\|>", "", text)
+    return cleaned.strip()
+
+
+def _decode_generated_tokens(model: HookedTransformer, generated_tokens: List[torch.Tensor]) -> List[str]:
+    if model.cfg.model_name.startswith("openai/gpt-oss-"):
+        decoded = [
+            model.tokenizer.decode(tokens, skip_special_tokens=False)
+            for tokens in generated_tokens
+        ]
+        return [_parse_gpt_oss_final_response(text) for text in decoded]
+    return model.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
 
 def tokenize_instructions(
     tokenizer: AutoTokenizer,
@@ -18,13 +60,26 @@ def tokenize_instructions(
     model_name: str = "meta-llama/Meta-Llama-3-8B-Instruct",
     add_generation_prompt: bool = True,
     apply_chat_template: bool = True,
+    reasoning_effort: str | None = None,
+    enable_thinking: bool | None = None,
 ) -> Int[Tensor, 'batch_size seq_len']:
     # Convert each instruction into a chat message format
     messages = [{"role": "user", "content": instruction} for instruction in instructions]
     
     # Apply the chat template using the tokenizer's built-in method
     if apply_chat_template and hasattr(tokenizer, "apply_chat_template"):
-        formatted_instructions = [tokenizer.apply_chat_template([msg], tokenize=False, add_generation_prompt=add_generation_prompt) for msg in messages]
+        chat_template_kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": add_generation_prompt,
+        }
+        if reasoning_effort is not None:
+            chat_template_kwargs["reasoning_effort"] = reasoning_effort
+        if enable_thinking is not None:
+            chat_template_kwargs["enable_thinking"] = enable_thinking
+        formatted_instructions = [
+            tokenizer.apply_chat_template([msg], **chat_template_kwargs)
+            for msg in messages
+        ]
         add_special_tokens = False
     else:
         print(f"Either apply_chat_template set to False or no chat template available. Using basic tokenization.")
@@ -39,13 +94,26 @@ def tokenize_instructions_harmful(
     model_name: str = "meta-llama/Meta-Llama-3-8B-Instruct",
     add_generation_prompt: bool = True,
     apply_chat_template: bool = True,
+    reasoning_effort: str | None = None,
+    enable_thinking: bool | None = None,
 ) -> Int[Tensor, 'batch_size seq_len']:
     # Convert each instruction into a chat message format
     messages = [{"role": "user", "content": instruction} for instruction in instructions]
     
     # Apply the chat template using the tokenizer's built-in method
     if apply_chat_template and hasattr(tokenizer, "apply_chat_template"):
-        formatted_instructions = [tokenizer.apply_chat_template([msg], tokenize=False, add_generation_prompt=add_generation_prompt) + "Sure," for msg in messages]
+        chat_template_kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": add_generation_prompt,
+        }
+        if reasoning_effort is not None:
+            chat_template_kwargs["reasoning_effort"] = reasoning_effort
+        if enable_thinking is not None:
+            chat_template_kwargs["enable_thinking"] = enable_thinking
+        formatted_instructions = [
+            tokenizer.apply_chat_template([msg], **chat_template_kwargs) + "Sure,"
+            for msg in messages
+        ]
     else:
         print(f"Either apply_chat_template set to False or no chat template available. Using basic tokenization.")
         formatted_instructions = [msg["content"] for msg in messages]
@@ -62,6 +130,7 @@ def _generate_with_hooks(
     batch_size = toks.shape[0]
     all_toks = torch.zeros((batch_size, toks.shape[1] + max_tokens_generated), dtype=torch.long, device="cuda")
     all_toks[:, :toks.shape[1]] = toks.to("cuda")
+    stop_token_ids = _get_stop_token_ids(model)
     
     # Track which sequences are still generating
     active_sequences = torch.ones(batch_size, dtype=torch.bool, device=toks.device)
@@ -75,9 +144,11 @@ def _generate_with_hooks(
             break
             
         with model.hooks(fwd_hooks=fwd_hooks):
-            names = lambda hook_name: 'resid' in hook_name
             with torch.no_grad():
-                logits, cache = model.run_with_cache(all_toks[:, :-max_tokens_generated + i].to("cuda"), names_filter=names)
+                logits = model(
+                    all_toks[:, :-max_tokens_generated + i].to("cuda"),
+                    return_type="logits",
+                )
                 
             #if cache_dir is not None and i == 0:
             #    # Only save the last token cache
@@ -93,7 +164,10 @@ def _generate_with_hooks(
                 active_sequences = active_sequences.to(next_tokens.device)
                 gen_lengths = gen_lengths.to(next_tokens.device)
 
-            eos_mask = (next_tokens == model.tokenizer.eos_token_id)
+            eos_mask = torch.isin(
+                next_tokens,
+                torch.tensor(list(stop_token_ids), device=next_tokens.device),
+            )
             active_sequences = active_sequences & ~eos_mask
             gen_lengths = gen_lengths + active_sequences.long()
             
@@ -109,7 +183,61 @@ def _generate_with_hooks(
         else:
             generated_tokens.append(torch.tensor([], dtype=torch.long, device=toks.device))
             
-    return model.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+    return _decode_generated_tokens(model, generated_tokens)
+
+
+def _generate_without_hooks(
+    model: HookedTransformer,
+    toks: Int[Tensor, 'batch_size seq_len'],
+    max_tokens_generated: int = 64,
+) -> List[str]:
+    batch_size = toks.shape[0]
+    device = model.cfg.device
+    prompt_toks = toks.to(device)
+    stop_token_ids = _get_stop_token_ids(model)
+    eos_token_id = model.tokenizer.eos_token_id
+
+    generated_toks = torch.zeros(
+        (batch_size, max_tokens_generated),
+        dtype=torch.long,
+        device=device,
+    )
+    active_sequences = torch.ones(batch_size, dtype=torch.bool, device=device)
+    gen_lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
+    past_kv_cache = HookedTransformerKeyValueCache.init_cache(model.cfg, device, batch_size)
+    current_toks = prompt_toks
+
+    for i in range(max_tokens_generated):
+        if not active_sequences.any():
+            break
+
+        with torch.no_grad():
+            logits = model(
+                current_toks,
+                return_type="logits",
+                past_kv_cache=past_kv_cache,
+            )
+
+        next_tokens = logits[:, -1, :].argmax(dim=-1)
+        active_sequences = active_sequences & ~torch.isin(
+            next_tokens,
+            torch.tensor(list(stop_token_ids), device=next_tokens.device),
+        )
+        gen_lengths = gen_lengths + active_sequences.long()
+        generated_toks[active_sequences, i] = next_tokens[active_sequences]
+
+        current_toks = next_tokens.unsqueeze(-1)
+        current_toks[~active_sequences] = eos_token_id
+
+    generated_tokens = []
+    for b in range(batch_size):
+        seq_len = gen_lengths[b].item()
+        if seq_len > 0:
+            generated_tokens.append(generated_toks[b, :seq_len])
+        else:
+            generated_tokens.append(torch.tensor([], dtype=torch.long, device=device))
+
+    return _decode_generated_tokens(model, generated_tokens)
 
 def get_generations(
     model: HookedTransformer,
@@ -127,15 +255,23 @@ def get_generations(
     for i in tqdm(range(0, len(instructions), batch_size), desc="Generating completions"):
         #print("Prompt:", instructions[i])
         toks = tokenize_instructions_fn(instructions=instructions[i:i+batch_size])
-        generation = _generate_with_hooks(
-            model,
-            toks,
-            max_tokens_generated=max_tokens_generated,
-            fwd_hooks=fwd_hooks,
-            cache_dir=os.path.join(cache_dir, f"samples_{i}-{i+batch_size}") if cache_dir is not None else None
-        )
+        if fwd_hooks:
+            generation = _generate_with_hooks(
+                model,
+                toks,
+                max_tokens_generated=max_tokens_generated,
+                fwd_hooks=fwd_hooks,
+                cache_dir=os.path.join(cache_dir, f"samples_{i}-{i+batch_size}") if cache_dir is not None else None
+            )
+        else:
+            generation = _generate_without_hooks(
+                model,
+                toks,
+                max_tokens_generated=max_tokens_generated,
+            )
         generations.extend(generation)
-        torch.cuda.empty_cache()
+        if fwd_hooks:
+            torch.cuda.empty_cache()
 
     return generations
 
@@ -164,6 +300,7 @@ def get_hiddens(
     """
     resid_pres_harmful = []
     resid_pres_harmless = []
+    target_hook_name = utils.get_act_name("resid_pre", layer)
     for i in tqdm(range(0, len(harmful_inst), batch_size), desc="Getting hidden states"):
         #print(f"Batch {i//batch_size} of {len(harmful_inst)//batch_size}")
         gc.collect(); torch.cuda.empty_cache()
@@ -173,12 +310,20 @@ def get_hiddens(
         assert (harmful_toks[:, -1] != model.tokenizer.eos_token_id).all(), "Right padding tokens found in harmful instructions"
         assert (harmless_toks[:, -1] != model.tokenizer.eos_token_id).all(), "Right padding tokens found in harmless instructions"
 
-        harmful_logits_batch, harmful_cache_batch = model.run_with_cache(harmful_toks, names_filter=lambda hook_name: 'resid' in hook_name)
+        with torch.no_grad():
+            harmful_logits_batch, harmful_cache_batch = model.run_with_cache(
+                harmful_toks,
+                names_filter=lambda hook_name: hook_name == target_hook_name,
+            )
         resid_pres_harmful.append(harmful_cache_batch['resid_pre', layer][:, pos, :].cpu())
         del harmful_toks, harmful_logits_batch, harmful_cache_batch
         gc.collect(); torch.cuda.empty_cache()
 
-        harmless_logits_batch, harmless_cache_batch = model.run_with_cache(harmless_toks, names_filter=lambda hook_name: 'resid' in hook_name)
+        with torch.no_grad():
+            harmless_logits_batch, harmless_cache_batch = model.run_with_cache(
+                harmless_toks,
+                names_filter=lambda hook_name: hook_name == target_hook_name,
+            )
         resid_pres_harmless.append(harmless_cache_batch['resid_pre', layer][:, pos, :].cpu())
         del harmless_toks, harmless_logits_batch, harmless_cache_batch
         gc.collect(); torch.cuda.empty_cache()

@@ -24,6 +24,8 @@ from argparse import ArgumentParser
 import numpy as np
 import random
 import math
+from env_utils import load_repo_env
+from gpt_oss_loading import load_gpt_oss_model
 
 from data_utils import (
     get_eval_dataset, 
@@ -116,6 +118,7 @@ def get_steering_direction(harmful_hiddens, harmless_hiddens, steering_type="mea
     return dir
 
 if __name__ == "__main__":
+    load_repo_env()
     start_time = time.time()
     print(f"Starting script at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
@@ -131,6 +134,11 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_dir", type=str, default=None, help="Directory containing the dataset results")
     parser.add_argument("--baseline_generations_dir", type=str, default=None, help="Directory containing baseline generations (should contain results.csv)")
     parser.add_argument("--answer_file_name", type=str, default="new_answer.txt", help="Name of the file containing the answers")
+    parser.add_argument("--n_inst_train", type=int, default=None, help="Override the dataset default number of training instructions")
+    parser.add_argument("--n_inst_test", type=int, default=None, help="Override the dataset default number of test instructions")
+    parser.add_argument("--n_inst_val", type=int, default=None, help="Override the dataset default number of validation instructions")
+    parser.add_argument("--max_tokens_generated", type=int, default=None, help="Override the dataset default max generated tokens")
+    parser.add_argument("--model_n_layers", type=int, default=None, help="Override the number of transformer layers loaded for models that support partial loading.")
     # Steering arguments
     parser.add_argument("--steering_type", type=str, default="refusal", choices=["refusal", "random", "mean", "prompt", "pca", "repe", "linear", "prompt-attention"], help="Type of steering to perform")
     parser.add_argument("--steer_to_pt", action="store_true", help="Steer to PT (defaults to CT)")
@@ -141,6 +149,39 @@ if __name__ == "__main__":
     parser.add_argument("--use_fluency", action="store_true", help="Whether to calculate and use fluency in steering")
     parser.add_argument("--grid_layers", action="store_true", help="Whether to grid search over layers")
     parser.add_argument("--normalize_dir", action="store_true", help="Whether to normalize the steering direction")
+    parser.add_argument(
+        "--reasoning_effort",
+        type=str,
+        choices=["low", "medium", "high"],
+        default=None,
+        help="Optional reasoning effort passed through the tokenizer chat template for models that support it."
+    )
+    thinking_group = parser.add_mutually_exclusive_group()
+    thinking_group.add_argument(
+        "--enable_thinking",
+        dest="enable_thinking",
+        action="store_true",
+        help="Enable thinking mode in tokenizer chat templates for models that support it."
+    )
+    thinking_group.add_argument(
+        "--disable_thinking",
+        dest="enable_thinking",
+        action="store_false",
+        help="Disable thinking mode in tokenizer chat templates for models that support it."
+    )
+    parser.set_defaults(enable_thinking=None)
+    parser.add_argument(
+        "--trust_remote_code",
+        action="store_true",
+        help="Pass trust_remote_code=True when loading model/tokenizer artifacts from Hugging Face."
+    )
+    parser.add_argument(
+        "--methods",
+        nargs="+",
+        choices=["prompt", "prompt-attention", "refusal", "random", "mean", "pca", "repe", "linear"],
+        default=None,
+        help="Subset of steering methods to run. Baseline always runs for comparison."
+    )
     args = parser.parse_args()
 
     dataset = args.dataset
@@ -149,10 +190,10 @@ if __name__ == "__main__":
     DEVICE = args.device
     batch_size = args.batch_size
     normalize_dir = args.normalize_dir
-    max_tokens_generated = DATASET_CONFIGS[dataset]["max_tokens_generated"]
-    N_INST_TRAIN = DATASET_CONFIGS[dataset]["n_inst_train"]
-    N_INST_TEST = DATASET_CONFIGS[dataset]["n_inst_test"]
-    N_INST_VAL = DATASET_CONFIGS[dataset]["n_inst_val"]
+    max_tokens_generated = args.max_tokens_generated if args.max_tokens_generated is not None else DATASET_CONFIGS[dataset]["max_tokens_generated"]
+    N_INST_TRAIN = args.n_inst_train if args.n_inst_train is not None else DATASET_CONFIGS[dataset]["n_inst_train"]
+    N_INST_TEST = args.n_inst_test if args.n_inst_test is not None else DATASET_CONFIGS[dataset]["n_inst_test"]
+    N_INST_VAL = args.n_inst_val if args.n_inst_val is not None else DATASET_CONFIGS[dataset]["n_inst_val"]
 
     assert dataset in DATASET_CONFIGS, f"Dataset {dataset} not found in DATASET_CONFIGS, please update the DATASET_CONFIGS dictionary in data_utils.py"
 
@@ -166,16 +207,30 @@ if __name__ == "__main__":
     else:
         baseline_generations_dir = args.baseline_generations_dir
 
-    model = HookedTransformer.from_pretrained_no_processing(
-        MODEL_PATH,
-        device=DEVICE,
-        dtype=torch.bfloat16,
-        default_padding_side='left',
-    )
+    trust_remote_code = args.trust_remote_code or MODEL_PATH.startswith("Qwen/Qwen3-") or MODEL_PATH.startswith("openai/gpt-oss-")
+    if trust_remote_code:
+        print(f"Loading {MODEL_PATH} with trust_remote_code=True")
+    if MODEL_PATH == "openai/gpt-oss-20b":
+        model = load_gpt_oss_model(device=DEVICE, n_layers=args.model_n_layers or 24)
+    else:
+        model = HookedTransformer.from_pretrained_no_processing(
+            MODEL_PATH,
+            device=DEVICE,
+            dtype=torch.bfloat16,
+            default_padding_side='left',
+            trust_remote_code=trust_remote_code,
+        )
 
     model.tokenizer.pad_token = model.tokenizer.eos_token
 
-    tokenize_instructions_fn = functools.partial(tokenize_instructions, tokenizer=model.tokenizer, model_name=MODEL_PATH, apply_chat_template=apply_chat_template)
+    tokenize_instructions_fn = functools.partial(
+        tokenize_instructions,
+        tokenizer=model.tokenizer,
+        model_name=MODEL_PATH,
+        apply_chat_template=apply_chat_template,
+        reasoning_effort=args.reasoning_effort,
+        enable_thinking=args.enable_thinking,
+    )
 
     # Get total number of layers
     if args.grid_layers:
@@ -216,6 +271,17 @@ if __name__ == "__main__":
     print(f"Len of steer_questions: {len(steer_questions)}, Len of steer_answers: {len(steer_answers)}, Len of steer_alt_answers: {len(steer_alt_answers)}")
     print(f"Len of steer_val_questions: {len(steer_val_questions)}, Len of steer_val_answers: {len(steer_val_answers)}, Len of steer_val_alt_answers: {len(steer_val_alt_answers)}")
     print(f"Eval args: {eval_args}")
+
+    selected_methods = set(args.methods) if args.methods is not None else {
+        "prompt",
+        "prompt-attention",
+        "refusal",
+        "random",
+        "mean",
+        "pca",
+        "repe",
+        "linear",
+    }
 
     print('\n' + 50*'=')
     print(f'### Running Evaluations ###')
@@ -261,171 +327,174 @@ if __name__ == "__main__":
     all_methods_results["baseline"] = baseline_results
 
     # 3. Run prompt method
-    prompt_start = time.time()
-    print("\nRunning prompt method")
-    print(50*'-')
-    prompt_output_dir = os.path.join(args.output_dir, f"{MODEL_PATH.split('/')[1]}", "prompt")
-    os.makedirs(prompt_output_dir, exist_ok=True)
+    if "prompt" in selected_methods:
+        prompt_start = time.time()
+        print("\nRunning prompt method")
+        print(50*'-')
+        prompt_output_dir = os.path.join(args.output_dir, f"{MODEL_PATH.split('/')[1]}", "prompt")
+        os.makedirs(prompt_output_dir, exist_ok=True)
 
-    # Check if prompt results exist
-    prompt_results, prompt_generations = load_existing_results(prompt_output_dir, "results")
-    if prompt_results is None:
-        print("Running prompt evaluation")
-        fwd_hooks = []
-        prompt_results, prompt_generations = run_evaluation_pipeline(
-            model=model,
-            dataset=dataset,
-            eval_type=eval_type,
-            eval_args=eval_args,
-            steer_dataset=steer_dataset,
-            steer_questions=steer_questions,
-            steer_answers=steer_answers,
-            steer_alt_answers=steer_alt_answers,
-            tokenize_instructions_fn=tokenize_instructions_fn,
-            fwd_hooks=fwd_hooks,
-            steer_prompt=steer_prompt,
-            max_tokens_generated=max_tokens_generated,
-            batch_size=batch_size,
-            use_fluency=args.use_fluency,
-            output_dir=prompt_output_dir,
-            baseline_results=baseline_results,
-            baseline_generations=baseline_generations,
-            best_factor=None  # Prompt method doesn't use a steering factor
-        )
-    prompt_time = time.time() - prompt_start
-    method_times["prompt"] = prompt_time
-    print_evaluation_results(prompt_results, prefix="prompt", use_fluency=args.use_fluency)
-    print(f"Prompt method took {prompt_time:.2f} seconds")
-    print(50*'-', '\n\n')
-    all_methods_results["prompt"] = prompt_results
+        # Check if prompt results exist
+        prompt_results, prompt_generations = load_existing_results(prompt_output_dir, "results")
+        if prompt_results is None:
+            print("Running prompt evaluation")
+            fwd_hooks = []
+            prompt_results, prompt_generations = run_evaluation_pipeline(
+                model=model,
+                dataset=dataset,
+                eval_type=eval_type,
+                eval_args=eval_args,
+                steer_dataset=steer_dataset,
+                steer_questions=steer_questions,
+                steer_answers=steer_answers,
+                steer_alt_answers=steer_alt_answers,
+                tokenize_instructions_fn=tokenize_instructions_fn,
+                fwd_hooks=fwd_hooks,
+                steer_prompt=steer_prompt,
+                max_tokens_generated=max_tokens_generated,
+                batch_size=batch_size,
+                use_fluency=args.use_fluency,
+                output_dir=prompt_output_dir,
+                baseline_results=baseline_results,
+                baseline_generations=baseline_generations,
+                best_factor=None  # Prompt method doesn't use a steering factor
+            )
+        prompt_time = time.time() - prompt_start
+        method_times["prompt"] = prompt_time
+        print_evaluation_results(prompt_results, prefix="prompt", use_fluency=args.use_fluency)
+        print(f"Prompt method took {prompt_time:.2f} seconds")
+        print(50*'-', '\n\n')
+        all_methods_results["prompt"] = prompt_results
 
     # 4. Run prompt-attention method
-    prompt_attention_start = time.time()
-    print("\nRunning prompt-attention method")
-    print(50*'-')
-    prompt_attention_output_dir = os.path.join(args.output_dir, f"{MODEL_PATH.split('/')[1]}", "prompt-attention")
-    os.makedirs(prompt_attention_output_dir, exist_ok=True)
+    if "prompt-attention" in selected_methods:
+        prompt_attention_start = time.time()
+        print("\nRunning prompt-attention method")
+        print(50*'-')
+        prompt_attention_output_dir = os.path.join(args.output_dir, f"{MODEL_PATH.split('/')[1]}", "prompt-attention")
+        os.makedirs(prompt_attention_output_dir, exist_ok=True)
 
-    # Check if prompt-attention results exist
-    prompt_attention_results, prompt_attention_generations = load_existing_results(prompt_attention_output_dir, "results")
-    if prompt_attention_results is None:
-        print("Running prompt-attention evaluation")
-        prompt_len = tokenize_instructions_fn(instructions=[steer_prompt], add_generation_prompt=True)[0].shape[0] - 5
-        print(f"Prompt length: {prompt_len}")
-        
-        # Check if best steering factor exists
-        best_factor_path = os.path.join(prompt_attention_output_dir, "best_steering_factor.txt")
-        if os.path.exists(best_factor_path):
-            with open(best_factor_path, 'r') as f:
-                best_steering_factor = float(f.read())
-        else:
-            steering_success_rates = []
-            fluencies = []
-            checked_factors = []
-            validation_examples = {}
-            for multiplier in range(1, 20, 2):
-                print(f"Testing multiplier: {multiplier}")
-                checked_factors.append(multiplier)
-                hook_fn = functools.partial(prompt_attention_ablation_hook, prompt_len=prompt_len, multiplier=multiplier)
-                fwd_hooks = [(utils.get_act_name('pattern', l), hook_fn) for l in range(model.cfg.n_layers)]
+        # Check if prompt-attention results exist
+        prompt_attention_results, prompt_attention_generations = load_existing_results(prompt_attention_output_dir, "results")
+        if prompt_attention_results is None:
+            print("Running prompt-attention evaluation")
+            prompt_len = tokenize_instructions_fn(instructions=[steer_prompt], add_generation_prompt=True)[0].shape[0] - 5
+            print(f"Prompt length: {prompt_len}")
+            
+            # Check if best steering factor exists
+            best_factor_path = os.path.join(prompt_attention_output_dir, "best_steering_factor.txt")
+            if os.path.exists(best_factor_path):
+                with open(best_factor_path, 'r') as f:
+                    best_steering_factor = float(f.read())
+            else:
+                steering_success_rates = []
+                fluencies = []
+                checked_factors = []
+                validation_examples = {}
+                for multiplier in range(1, 20, 2):
+                    print(f"Testing multiplier: {multiplier}")
+                    checked_factors.append(multiplier)
+                    hook_fn = functools.partial(prompt_attention_ablation_hook, prompt_len=prompt_len, multiplier=multiplier)
+                    fwd_hooks = [(utils.get_act_name('pattern', l), hook_fn) for l in range(model.cfg.n_layers)]
 
-                val_steer_generations = get_generations(
-                    model,
-                    [steer_prompt + sample for sample in steer_val_dataset],
-                    tokenize_instructions_fn,
-                    fwd_hooks=fwd_hooks,
-                    max_tokens_generated=max_tokens_generated,
-                    batch_size=1
-                )
+                    val_steer_generations = get_generations(
+                        model,
+                        [steer_prompt + sample for sample in steer_val_dataset],
+                        tokenize_instructions_fn,
+                        fwd_hooks=fwd_hooks,
+                        max_tokens_generated=max_tokens_generated,
+                        batch_size=1
+                    )
 
-                val_results = evaluate_generations(
-                    generations=val_steer_generations,
-                    dataset=dataset,
-                    eval_type=eval_type,
-                    eval_args=eval_args,
-                    questions=steer_val_questions,
-                    answers=steer_val_answers,
-                    alt_answers=steer_val_alt_answers,
-                    is_validation=True,
-                    use_fluency=args.use_fluency,
-                    steer_dataset=steer_val_dataset
-                )
+                    val_results = evaluate_generations(
+                        generations=val_steer_generations,
+                        dataset=dataset,
+                        eval_type=eval_type,
+                        eval_args=eval_args,
+                        questions=steer_val_questions,
+                        answers=steer_val_answers,
+                        alt_answers=steer_val_alt_answers,
+                        is_validation=True,
+                        use_fluency=args.use_fluency,
+                        steer_dataset=steer_val_dataset
+                    )
 
-                steering_success_rates.append(val_results["score"])
-                if args.use_fluency:
-                    fluencies.append(val_results["fluency"])
-                    print(f"Fluency: {val_results['fluency']}")
-                    if val_results["fluency"] < 1:
-                        print(f"Fluency: {val_results['fluency']} < 1, ending search")
-                        break
-                
-                validation_examples[multiplier] = []
-                for i in range(len(val_steer_generations)):
-                    example = {'sample': steer_val_dataset[i], 
-                    'generation': val_steer_generations[i], 
-                    'score': val_results['per_sample'][i]['score'], 
-                    'fluency': val_results['per_sample'][i]['fluency'] if args.use_fluency else None
-                    }
-                    validation_examples[multiplier].append(example)
-
-                print(f"Score: {val_results['score']}")
-                print(50*'-')
-
-            # Save validation examples
-            with open(os.path.join(prompt_attention_output_dir, f"validation_examples.json"), 'w') as f:
-                json.dump(validation_examples, f, indent=2)
-
-            # Select best steering factor
-            steering_success_rates = np.array(steering_success_rates)
-            fluencies = np.array(fluencies) if args.use_fluency else None
-            with open(os.path.join(prompt_attention_output_dir, f"acc_fluency.txt"), 'w') as f:
-                for i in range(len(steering_success_rates)):
+                    steering_success_rates.append(val_results["score"])
                     if args.use_fluency:
-                        f.write(f"{checked_factors[i]}, {steering_success_rates[i]}, {fluencies[i]}\n")
-                    else:
-                        f.write(f"{checked_factors[i]}, {steering_success_rates[i]}\n")
-            if args.use_fluency:
-                steering_success_rates[fluencies < 1] = -1
-            best_steering_factor = checked_factors[np.argmax(steering_success_rates)]
-            print(f"Best steering factor: {best_steering_factor}")
-            with open(best_factor_path, 'w') as f:
-                f.write(f"{best_steering_factor}")
+                        fluencies.append(val_results["fluency"])
+                        print(f"Fluency: {val_results['fluency']}")
+                        if val_results["fluency"] < 1:
+                            print(f"Fluency: {val_results['fluency']} < 1, ending search")
+                            break
+                    
+                    validation_examples[multiplier] = []
+                    for i in range(len(val_steer_generations)):
+                        example = {'sample': steer_val_dataset[i], 
+                        'generation': val_steer_generations[i], 
+                        'score': val_results['per_sample'][i]['score'], 
+                        'fluency': val_results['per_sample'][i]['fluency'] if args.use_fluency else None
+                        }
+                        validation_examples[multiplier].append(example)
 
-        hook_fn = functools.partial(prompt_attention_ablation_hook, prompt_len=prompt_len, multiplier=best_steering_factor)
-        fwd_hooks = [(utils.get_act_name('pattern', l), hook_fn) for l in range(model.cfg.n_layers)]
+                    print(f"Score: {val_results['score']}")
+                    print(50*'-')
 
-        prompt_attention_results, prompt_attention_generations = run_evaluation_pipeline(
-            model=model,
-            dataset=dataset,
-            eval_type=eval_type,
-            eval_args=eval_args,
-            steer_dataset=steer_dataset,
-            steer_questions=steer_questions,
-            steer_answers=steer_answers,
-            steer_alt_answers=steer_alt_answers,
-            tokenize_instructions_fn=tokenize_instructions_fn,
-            fwd_hooks=fwd_hooks,
-            steer_prompt=steer_prompt,
-            max_tokens_generated=max_tokens_generated,
-            batch_size=1,
-            use_fluency=args.use_fluency,
-            output_dir=prompt_attention_output_dir,
-            baseline_results=baseline_results,
-            baseline_generations=baseline_generations,
-            best_factor=best_steering_factor
-        )
-    prompt_attention_time = time.time() - prompt_attention_start
-    method_times["prompt-attention"] = prompt_attention_time
-    print_evaluation_results(prompt_attention_results, prefix="prompt-attention", use_fluency=args.use_fluency)
-    print(f"Prompt-attention method took {prompt_attention_time:.2f} seconds")
-    print(50*'-', '\n\n')
-    all_methods_results["prompt-attention"] = prompt_attention_results
+                # Save validation examples
+                with open(os.path.join(prompt_attention_output_dir, f"validation_examples.json"), 'w') as f:
+                    json.dump(validation_examples, f, indent=2)
+
+                # Select best steering factor
+                steering_success_rates = np.array(steering_success_rates)
+                fluencies = np.array(fluencies) if args.use_fluency else None
+                with open(os.path.join(prompt_attention_output_dir, f"acc_fluency.txt"), 'w') as f:
+                    for i in range(len(steering_success_rates)):
+                        if args.use_fluency:
+                            f.write(f"{checked_factors[i]}, {steering_success_rates[i]}, {fluencies[i]}\n")
+                        else:
+                            f.write(f"{checked_factors[i]}, {steering_success_rates[i]}\n")
+                if args.use_fluency:
+                    steering_success_rates[fluencies < 1] = -1
+                best_steering_factor = checked_factors[np.argmax(steering_success_rates)]
+                print(f"Best steering factor: {best_steering_factor}")
+                with open(best_factor_path, 'w') as f:
+                    f.write(f"{best_steering_factor}")
+
+            hook_fn = functools.partial(prompt_attention_ablation_hook, prompt_len=prompt_len, multiplier=best_steering_factor)
+            fwd_hooks = [(utils.get_act_name('pattern', l), hook_fn) for l in range(model.cfg.n_layers)]
+
+            prompt_attention_results, prompt_attention_generations = run_evaluation_pipeline(
+                model=model,
+                dataset=dataset,
+                eval_type=eval_type,
+                eval_args=eval_args,
+                steer_dataset=steer_dataset,
+                steer_questions=steer_questions,
+                steer_answers=steer_answers,
+                steer_alt_answers=steer_alt_answers,
+                tokenize_instructions_fn=tokenize_instructions_fn,
+                fwd_hooks=fwd_hooks,
+                steer_prompt=steer_prompt,
+                max_tokens_generated=max_tokens_generated,
+                batch_size=1,
+                use_fluency=args.use_fluency,
+                output_dir=prompt_attention_output_dir,
+                baseline_results=baseline_results,
+                baseline_generations=baseline_generations,
+                best_factor=best_steering_factor
+            )
+        prompt_attention_time = time.time() - prompt_attention_start
+        method_times["prompt-attention"] = prompt_attention_time
+        print_evaluation_results(prompt_attention_results, prefix="prompt-attention", use_fluency=args.use_fluency)
+        print(f"Prompt-attention method took {prompt_attention_time:.2f} seconds")
+        print(50*'-', '\n\n')
+        all_methods_results["prompt-attention"] = prompt_attention_results
 
     # 5. Run other steering methods
-    other_methods = ["refusal", "random", "mean", "pca", "repe", "linear"]
+    other_methods = [method for method in ["refusal", "random", "mean", "pca", "repe", "linear"] if method in selected_methods]
     
     # Dictionary to store validation results for each method
     validation_results = {}
+    layer_hidden_cache = {}
     
     # For each method, do grid search over layers and steering factors
     for steering_type in other_methods:
@@ -482,20 +551,24 @@ if __name__ == "__main__":
                 layer_output_dir = os.path.join(method_output_dir, f"layer_{layer}")
                 os.makedirs(layer_output_dir, exist_ok=True)
                 
-                # Compute hiddens for this layer
-                hiddens_start = time.time()
-                print(f"Computing hiddens for layer {layer}")
-                resid_pres_harmful, resid_pres_harmless = get_hiddens(
-                    model=model,
-                    harmful_inst=harmful_inst_train,
-                    harmless_inst=harmless_inst_train,
-                    layer=layer,
-                    pos=pos,
-                    tokenize_instructions_fn=tokenize_instructions_fn,
-                    batch_size=batch_size
-                )
-                hiddens_time = time.time() - hiddens_start
-                print(f"Computing hiddens took {hiddens_time:.2f} seconds")
+                if layer in layer_hidden_cache:
+                    print(f"Reusing cached hiddens for layer {layer}")
+                    resid_pres_harmful, resid_pres_harmless = layer_hidden_cache[layer]
+                else:
+                    hiddens_start = time.time()
+                    print(f"Computing hiddens for layer {layer}")
+                    resid_pres_harmful, resid_pres_harmless = get_hiddens(
+                        model=model,
+                        harmful_inst=harmful_inst_train,
+                        harmless_inst=harmless_inst_train,
+                        layer=layer,
+                        pos=pos,
+                        tokenize_instructions_fn=tokenize_instructions_fn,
+                        batch_size=batch_size
+                    )
+                    layer_hidden_cache[layer] = (resid_pres_harmful, resid_pres_harmless)
+                    hiddens_time = time.time() - hiddens_start
+                    print(f"Computing hiddens took {hiddens_time:.2f} seconds")
                 
                 # Get steering direction for this method
                 steering_direction = get_steering_direction(resid_pres_harmful, resid_pres_harmless, steering_type, 
@@ -593,8 +666,6 @@ if __name__ == "__main__":
                             print(f"Validation fluency: {val_results.get('fluency', 0):.3f}")
                         print(50*'-')
                 
-                # Clean up memory
-                del resid_pres_harmful, resid_pres_harmless
                 gc.collect()
                 torch.cuda.empty_cache()
             
