@@ -229,7 +229,11 @@ def get_toxicity_score(response, args):
 
 def judge_emotions(response, emotion, args):
     classifier = get_emotion_classifier()
-    scores = classifier(response)
+    scores = classifier(
+        response,
+        truncation=True,
+        max_length=classifier.tokenizer.model_max_length,
+    )
     score_emotion = next(d["score"] for d in scores[0] if d["label"] == emotion)
     return score_emotion
 
