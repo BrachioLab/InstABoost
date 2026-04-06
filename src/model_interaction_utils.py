@@ -35,6 +35,44 @@ def _get_stop_token_ids(model: HookedTransformer) -> set[int]:
     return {int(token_id) for token_id in stop_token_ids if token_id is not None}
 
 
+def _sample_next_tokens(
+    logits: torch.Tensor,
+    generation_config: dict | None,
+) -> torch.Tensor:
+    if not generation_config or not generation_config.get("do_sample", False):
+        return logits.argmax(dim=-1)
+
+    sampling_logits = logits.to(torch.float32)
+    temperature = float(generation_config.get("temperature", 1.0))
+    if temperature > 0 and temperature != 1.0:
+        sampling_logits = sampling_logits / temperature
+
+    top_k = int(generation_config.get("top_k", 0) or 0)
+    if top_k > 0 and top_k < sampling_logits.shape[-1]:
+        top_values, _ = torch.topk(sampling_logits, top_k, dim=-1)
+        kth_values = top_values[:, -1].unsqueeze(-1)
+        sampling_logits = torch.where(
+            sampling_logits < kth_values,
+            torch.full_like(sampling_logits, float("-inf")),
+            sampling_logits,
+        )
+
+    top_p = float(generation_config.get("top_p", 1.0))
+    if 0 < top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(sampling_logits, descending=True, dim=-1)
+        sorted_probs = torch.softmax(sorted_logits, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        sorted_mask = cumulative_probs > top_p
+        sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
+        sorted_mask[..., 0] = False
+        filtered_sorted_logits = sorted_logits.masked_fill(sorted_mask, float("-inf"))
+        sampling_logits = torch.full_like(sampling_logits, float("-inf"))
+        sampling_logits.scatter_(dim=-1, index=sorted_indices, src=filtered_sorted_logits)
+
+    probs = torch.softmax(sampling_logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+
 def _parse_gpt_oss_final_response(text: str) -> str:
     matches = re.findall(
         r"<\|channel\|>final<\|message\|>(.*?)(?:<\|end\|>|<\|return\|>|<\|start\|>|$)",
@@ -239,6 +277,7 @@ def _generate_with_hooks(
     prompt_toks = toks.to(device)
     stop_token_ids = _get_stop_token_ids(model)
     eos_token_id = model.tokenizer.eos_token_id
+    generation_config = getattr(model, "generation_config_overrides", None)
 
     generated_toks = torch.zeros(
         (batch_size, max_tokens_generated),
@@ -277,7 +316,7 @@ def _generate_with_hooks(
                     past_kv_cache=past_kv_cache,
                 )
 
-        next_tokens = logits[:, -1, :].argmax(dim=-1)
+        next_tokens = _sample_next_tokens(logits[:, -1, :], generation_config)
         active_sequences = active_sequences & ~torch.isin(
             next_tokens,
             torch.tensor(list(stop_token_ids), device=next_tokens.device),
@@ -309,6 +348,7 @@ def _generate_without_hooks(
     prompt_toks = toks.to(device)
     stop_token_ids = _get_stop_token_ids(model)
     eos_token_id = model.tokenizer.eos_token_id
+    generation_config = getattr(model, "generation_config_overrides", None)
 
     generated_toks = torch.zeros(
         (batch_size, max_tokens_generated),
@@ -331,7 +371,7 @@ def _generate_without_hooks(
                 past_kv_cache=past_kv_cache,
             )
 
-        next_tokens = logits[:, -1, :].argmax(dim=-1)
+        next_tokens = _sample_next_tokens(logits[:, -1, :], generation_config)
         active_sequences = active_sequences & ~torch.isin(
             next_tokens,
             torch.tensor(list(stop_token_ids), device=next_tokens.device),

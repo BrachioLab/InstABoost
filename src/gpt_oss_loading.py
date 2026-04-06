@@ -71,6 +71,19 @@ def create_gpt_oss_config(
     n_layers: int | None = None,
 ) -> HookedTransformerConfig:
     total_layers = hf_config.num_hidden_layers if n_layers is None else n_layers
+    layer_types = getattr(hf_config, "layer_types", None)
+    if layer_types is not None:
+        layer_types = layer_types[:total_layers]
+        attn_types = [
+            "local" if layer_type == "sliding_attention" else "global"
+            for layer_type in layer_types
+        ]
+        use_local_attn = any(attn_type == "local" for attn_type in attn_types)
+        window_size = getattr(hf_config, "sliding_window", None)
+    else:
+        attn_types = None
+        use_local_attn = False
+        window_size = None
     return HookedTransformerConfig(
         n_layers=total_layers,
         d_model=hf_config.hidden_size,
@@ -87,7 +100,9 @@ def create_gpt_oss_config(
         n_key_value_heads=hf_config.num_key_value_heads,
         gated_mlp=True,
         final_rms=True,
-        use_local_attn=False,
+        use_local_attn=use_local_attn,
+        attn_types=attn_types,
+        window_size=window_size,
         rotary_dim=hf_config.head_dim,
         num_experts=hf_config.num_local_experts,
         experts_per_token=hf_config.num_experts_per_tok,
@@ -302,4 +317,10 @@ def load_gpt_oss_model(device: str = "cuda", n_layers: int = 24) -> HookedTransf
     model.cfg.device = device
     model.tokenizer.padding_side = "left"
     model.generation_stop_token_ids = generation_config.get("eos_token_id", [model.tokenizer.eos_token_id])
+    model.generation_config_overrides = {
+        "do_sample": False,
+        "temperature": float(generation_config.get("temperature", 1.0)),
+        "top_k": int(generation_config.get("top_k", 0) or 0),
+        "top_p": float(generation_config.get("top_p", 1.0)),
+    }
     return model
