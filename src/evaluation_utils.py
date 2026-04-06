@@ -369,7 +369,9 @@ def run_evaluation_pipeline(
     layer: Optional[int] = None,
     best_factor: Optional[float] = None,
     baseline_results: Optional[Dict[str, Any]] = None,
-    baseline_generations: Optional[List[str]] = None
+    baseline_generations: Optional[List[str]] = None,
+    prompt_spans: Optional[List[Tuple[int, int, int]]] = None,
+    attention_pattern_multiplier: Optional[float] = None,
 ) -> Tuple[Dict[str, Any], List[str]]:
     """
     Run the complete evaluation pipeline including generation, evaluation, and saving results.
@@ -407,7 +409,9 @@ def run_evaluation_pipeline(
         fwd_hooks=fwd_hooks,
         max_tokens_generated=max_tokens_generated,
         batch_size=batch_size,
-        cache_dir=cache_dir
+        cache_dir=cache_dir,
+        prompt_spans=prompt_spans,
+        attention_pattern_multiplier=attention_pattern_multiplier,
     )
     
     # Evaluate generations

@@ -65,15 +65,39 @@ def in_direction_ablation_hook(
     direction = direction.to(activation.device)
     return activation + multiplier * direction.unsqueeze(0)
 
-def prompt_attention_ablation_hook(
-    attn_scores: Float[Tensor, "... d_act"],
-    hook: HookPoint,
-    prompt_len: int,
-    multiplier: float = 3.0
-):
-    attn_scores[:, :, :, :prompt_len] *= multiplier
-    attn_scores = torch.nn.functional.normalize(attn_scores, p=1, dim=-1)
-    return attn_scores
+def get_prompt_span(full_instruction: str, base_instruction: str, tokenize_instructions_fn) -> tuple[int, int, int]:
+    full_tokens = tokenize_instructions_fn(instructions=[full_instruction])[0].tolist()
+    base_tokens = tokenize_instructions_fn(instructions=[base_instruction])[0].tolist()
+
+    prefix_len = 0
+    max_prefix = min(len(full_tokens), len(base_tokens))
+    while prefix_len < max_prefix and full_tokens[prefix_len] == base_tokens[prefix_len]:
+        prefix_len += 1
+
+    full_remaining = len(full_tokens) - prefix_len
+    base_remaining = len(base_tokens) - prefix_len
+    suffix_len = 0
+    max_suffix = min(full_remaining, base_remaining)
+    while (
+        suffix_len < max_suffix
+        and full_tokens[len(full_tokens) - suffix_len - 1] == base_tokens[len(base_tokens) - suffix_len - 1]
+    ):
+        suffix_len += 1
+
+    full_end = len(full_tokens) - suffix_len
+    if full_end < prefix_len:
+        full_end = prefix_len
+
+    return prefix_len, full_end, len(full_tokens)
+
+
+def get_prompt_spans(steer_prompt: str, samples: list[str], tokenize_instructions_fn) -> list[tuple[int, int, int]]:
+    if not steer_prompt:
+        raise ValueError("Prompt-attention requires a non-empty steer_prompt")
+    return [
+        get_prompt_span(steer_prompt + sample, sample, tokenize_instructions_fn)
+        for sample in samples
+    ]
 
 def get_steering_direction(harmful_hiddens, harmless_hiddens, steering_type="mean", normalize: bool = True):
     dir = None
@@ -379,8 +403,10 @@ if __name__ == "__main__":
         prompt_attention_results, prompt_attention_generations = load_existing_results(prompt_attention_output_dir, "results")
         if prompt_attention_results is None:
             print("Running prompt-attention evaluation")
-            prompt_len = tokenize_instructions_fn(instructions=[steer_prompt], add_generation_prompt=True)[0].shape[0] - 5
-            print(f"Prompt length: {prompt_len}")
+            val_prompt_spans = get_prompt_spans(steer_prompt, steer_val_dataset, tokenize_instructions_fn)
+            prompt_spans = get_prompt_spans(steer_prompt, steer_dataset, tokenize_instructions_fn)
+            example_prompt_span = val_prompt_spans[0]
+            print(f"Prompt span example (start, end, full_len): {example_prompt_span}")
             
             # Check if best steering factor exists
             best_factor_path = os.path.join(prompt_attention_output_dir, "best_steering_factor.txt")
@@ -395,16 +421,16 @@ if __name__ == "__main__":
                 for multiplier in range(1, 20, 2):
                     print(f"Testing multiplier: {multiplier}")
                     checked_factors.append(multiplier)
-                    hook_fn = functools.partial(prompt_attention_ablation_hook, prompt_len=prompt_len, multiplier=multiplier)
-                    fwd_hooks = [(utils.get_act_name('pattern', l), hook_fn) for l in range(model.cfg.n_layers)]
 
                     val_steer_generations = get_generations(
                         model,
                         [steer_prompt + sample for sample in steer_val_dataset],
                         tokenize_instructions_fn,
-                        fwd_hooks=fwd_hooks,
+                        fwd_hooks=[],
                         max_tokens_generated=max_tokens_generated,
-                        batch_size=1
+                        batch_size=batch_size,
+                        prompt_spans=val_prompt_spans,
+                        attention_pattern_multiplier=multiplier,
                     )
 
                     val_results = evaluate_generations(
@@ -460,9 +486,6 @@ if __name__ == "__main__":
                 with open(best_factor_path, 'w') as f:
                     f.write(f"{best_steering_factor}")
 
-            hook_fn = functools.partial(prompt_attention_ablation_hook, prompt_len=prompt_len, multiplier=best_steering_factor)
-            fwd_hooks = [(utils.get_act_name('pattern', l), hook_fn) for l in range(model.cfg.n_layers)]
-
             prompt_attention_results, prompt_attention_generations = run_evaluation_pipeline(
                 model=model,
                 dataset=dataset,
@@ -473,15 +496,17 @@ if __name__ == "__main__":
                 steer_answers=steer_answers,
                 steer_alt_answers=steer_alt_answers,
                 tokenize_instructions_fn=tokenize_instructions_fn,
-                fwd_hooks=fwd_hooks,
+                fwd_hooks=[],
                 steer_prompt=steer_prompt,
                 max_tokens_generated=max_tokens_generated,
-                batch_size=1,
+                batch_size=batch_size,
                 use_fluency=args.use_fluency,
                 output_dir=prompt_attention_output_dir,
                 baseline_results=baseline_results,
                 baseline_generations=baseline_generations,
-                best_factor=best_steering_factor
+                best_factor=best_steering_factor,
+                prompt_spans=prompt_spans,
+                attention_pattern_multiplier=best_steering_factor,
             )
         prompt_attention_time = time.time() - prompt_attention_start
         method_times["prompt-attention"] = prompt_attention_time

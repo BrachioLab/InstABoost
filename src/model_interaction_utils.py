@@ -1,6 +1,7 @@
 import os
 import gc
 import re
+import functools
 from typing import List, Callable, Tuple
 
 import torch
@@ -104,6 +105,35 @@ def _decode_generated_tokens(model: HookedTransformer, generated_tokens: List[to
         return [_truncate_gpt_oss_degenerate_tail(_parse_gpt_oss_final_response(text)) for text in decoded]
     return model.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
 
+
+def prompt_attention_ablation_hook(
+    pattern: torch.Tensor,
+    hook: HookPoint,
+    prompt_key_mask: torch.Tensor,
+    multiplier: float = 3.0,
+):
+    if multiplier == 1.0:
+        return pattern
+
+    mask = prompt_key_mask.to(device=pattern.device, dtype=pattern.dtype)
+    if mask.shape[-1] < pattern.shape[-1]:
+        pad_width = pattern.shape[-1] - mask.shape[-1]
+        mask = torch.nn.functional.pad(mask, (0, pad_width))
+    elif mask.shape[-1] > pattern.shape[-1]:
+        mask = mask[:, :pattern.shape[-1]]
+
+    scale = 1 + (multiplier - 1) * mask[:, None, None, :]
+    original_visible_mass = pattern.sum(dim=-1, keepdim=True)
+    scaled_pattern = pattern * scale
+    scaled_visible_mass = scaled_pattern.sum(dim=-1, keepdim=True)
+    safe_denominator = torch.where(
+        scaled_visible_mass > 0,
+        scaled_visible_mass,
+        torch.ones_like(scaled_visible_mass),
+    )
+    scaled_pattern = scaled_pattern / safe_denominator
+    return scaled_pattern * original_visible_mass
+
 def tokenize_instructions(
     tokenizer: AutoTokenizer,
     instructions: List[str],
@@ -112,6 +142,7 @@ def tokenize_instructions(
     apply_chat_template: bool = True,
     reasoning_effort: str | None = None,
     enable_thinking: bool | None = None,
+    return_attention_mask: bool = False,
 ) -> Int[Tensor, 'batch_size seq_len']:
     # Apply the chat template using the tokenizer's built-in method
     if apply_chat_template and hasattr(tokenizer, "apply_chat_template"):
@@ -139,7 +170,15 @@ def tokenize_instructions(
         ]
         add_special_tokens = True
 
-    return tokenizer(formatted_instructions, padding=True, return_tensors="pt", add_special_tokens=add_special_tokens).input_ids
+    encodings = tokenizer(
+        formatted_instructions,
+        padding=True,
+        return_tensors="pt",
+        add_special_tokens=add_special_tokens,
+    )
+    if return_attention_mask:
+        return encodings.input_ids, encodings.attention_mask
+    return encodings.input_ids
 
 def tokenize_instructions_harmful(
     tokenizer: AutoTokenizer,
@@ -149,6 +188,7 @@ def tokenize_instructions_harmful(
     apply_chat_template: bool = True,
     reasoning_effort: str | None = None,
     enable_thinking: bool | None = None,
+    return_attention_mask: bool = False,
 ) -> Int[Tensor, 'batch_size seq_len']:
     # Apply the chat template using the tokenizer's built-in method
     if apply_chat_template and hasattr(tokenizer, "apply_chat_template"):
@@ -174,7 +214,15 @@ def tokenize_instructions_harmful(
             for instruction in instructions
         ]
     
-    return tokenizer(formatted_instructions, padding=True, return_tensors="pt", add_special_tokens=False).input_ids
+    encodings = tokenizer(
+        formatted_instructions,
+        padding=True,
+        return_tensors="pt",
+        add_special_tokens=False,
+    )
+    if return_attention_mask:
+        return encodings.input_ids, encodings.attention_mask
+    return encodings.input_ids
 
 def _generate_with_hooks(
     model: HookedTransformer,
@@ -182,15 +230,25 @@ def _generate_with_hooks(
     max_tokens_generated: int = 64,
     fwd_hooks = [],
     cache_dir: str = None,
+    prompt_key_mask: torch.Tensor | None = None,
+    attention_pattern_multiplier: float | None = None,
+    attention_mask: torch.Tensor | None = None,
 ) -> List[str]:
+    device = model.cfg.device
     batch_size = toks.shape[0]
-    all_toks = torch.zeros((batch_size, toks.shape[1] + max_tokens_generated), dtype=torch.long, device="cuda")
-    all_toks[:, :toks.shape[1]] = toks.to("cuda")
+    prompt_toks = toks.to(device)
     stop_token_ids = _get_stop_token_ids(model)
-    
-    # Track which sequences are still generating
-    active_sequences = torch.ones(batch_size, dtype=torch.bool, device=toks.device)
-    gen_lengths = torch.zeros(batch_size, dtype=torch.long, device=toks.device)
+    eos_token_id = model.tokenizer.eos_token_id
+
+    generated_toks = torch.zeros(
+        (batch_size, max_tokens_generated),
+        dtype=torch.long,
+        device=device,
+    )
+    active_sequences = torch.ones(batch_size, dtype=torch.bool, device=device)
+    gen_lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
+    past_kv_cache = HookedTransformerKeyValueCache.init_cache(model.cfg, device, batch_size)
+    current_toks = prompt_toks
 
     if cache_dir is not None:
         os.makedirs(cache_dir, exist_ok=True)
@@ -198,47 +256,46 @@ def _generate_with_hooks(
     for i in range(max_tokens_generated):
         if not active_sequences.any():
             break
-            
-        with model.hooks(fwd_hooks=fwd_hooks):
+
+        current_hooks = fwd_hooks
+        if prompt_key_mask is not None and attention_pattern_multiplier is not None:
+            prompt_attention_hook = functools.partial(
+                prompt_attention_ablation_hook,
+                prompt_key_mask=prompt_key_mask,
+                multiplier=attention_pattern_multiplier,
+            )
+            current_hooks = current_hooks + [
+                (utils.get_act_name("pattern", layer), prompt_attention_hook)
+                for layer in range(model.cfg.n_layers)
+            ]
+
+        with model.hooks(fwd_hooks=current_hooks):
             with torch.no_grad():
                 logits = model(
-                    all_toks[:, :-max_tokens_generated + i].to("cuda"),
+                    current_toks,
                     return_type="logits",
+                    past_kv_cache=past_kv_cache,
                 )
-                
-            #if cache_dir is not None and i == 0:
-            #    # Only save the last token cache
-            #    cache = cache.to("cpu")
-            #    for k in cache.cache_dict:
-            #        cache.cache_dict[k] = cache.cache_dict[k][:, -1, :]
-            #    np.savez(os.path.join(cache_dir, f"token_{i}.npz"), cache.cache_dict)
-            
-            next_tokens = logits[:, -1, :].argmax(dim=-1) # greedy sampling (temperature=0)
-            
-            # Update active sequences and generation lengths
-            if i == 0:
-                active_sequences = active_sequences.to(next_tokens.device)
-                gen_lengths = gen_lengths.to(next_tokens.device)
 
-            eos_mask = torch.isin(
-                next_tokens,
-                torch.tensor(list(stop_token_ids), device=next_tokens.device),
-            )
-            active_sequences = active_sequences & ~eos_mask
-            gen_lengths = gen_lengths + active_sequences.long()
-            
-            # Only update tokens for active sequences
-            all_toks[active_sequences, -max_tokens_generated+i] = next_tokens[active_sequences]
+        next_tokens = logits[:, -1, :].argmax(dim=-1)
+        active_sequences = active_sequences & ~torch.isin(
+            next_tokens,
+            torch.tensor(list(stop_token_ids), device=next_tokens.device),
+        )
+        gen_lengths = gen_lengths + active_sequences.long()
+        generated_toks[active_sequences, i] = next_tokens[active_sequences]
 
-    # Decode only the generated portion for each sequence
+        current_toks = next_tokens.unsqueeze(-1)
+        current_toks[~active_sequences] = eos_token_id
+
     generated_tokens = []
     for b in range(batch_size):
         seq_len = gen_lengths[b].item()
         if seq_len > 0:
-            generated_tokens.append(all_toks[b, toks.shape[1]:toks.shape[1] + seq_len])
+            generated_tokens.append(generated_toks[b, :seq_len])
         else:
-            generated_tokens.append(torch.tensor([], dtype=torch.long, device=toks.device))
-            
+            generated_tokens.append(torch.tensor([], dtype=torch.long, device=device))
+
     return _decode_generated_tokens(model, generated_tokens)
 
 
@@ -302,7 +359,9 @@ def get_generations(
     fwd_hooks = [],
     max_tokens_generated: int = 64,
     batch_size: int = 4,
-    cache_dir: str = None
+    cache_dir: str = None,
+    prompt_spans: List[Tuple[int, int, int]] | None = None,
+    attention_pattern_multiplier: float | None = None,
 ) -> List[str]:
 
     # assert batch_size == 1, "Batch size must be 1 for now"
@@ -310,14 +369,45 @@ def get_generations(
 
     for i in tqdm(range(0, len(instructions), batch_size), desc="Generating completions"):
         #print("Prompt:", instructions[i])
-        toks = tokenize_instructions_fn(instructions=instructions[i:i+batch_size])
+        need_attention_mask = bool(fwd_hooks) or (
+            prompt_spans is not None and attention_pattern_multiplier is not None
+        )
+        if need_attention_mask:
+            toks, attention_mask = tokenize_instructions_fn(
+                instructions=instructions[i:i+batch_size],
+                return_attention_mask=True,
+            )
+        else:
+            toks = tokenize_instructions_fn(instructions=instructions[i:i+batch_size])
+            attention_mask = None
+        prompt_key_mask = None
+        if prompt_spans is not None:
+            batch_prompt_spans = prompt_spans[i:i+batch_size]
+            prompt_key_mask = torch.zeros((len(batch_prompt_spans), toks.shape[1]), dtype=torch.float32)
+            for batch_idx, (start_idx, end_idx, token_count) in enumerate(batch_prompt_spans):
+                pad_len = toks.shape[1] - token_count
+                prompt_key_mask[batch_idx, pad_len + start_idx:pad_len + end_idx] = 1.0
         if fwd_hooks:
             generation = _generate_with_hooks(
                 model,
                 toks,
                 max_tokens_generated=max_tokens_generated,
                 fwd_hooks=fwd_hooks,
-                cache_dir=os.path.join(cache_dir, f"samples_{i}-{i+batch_size}") if cache_dir is not None else None
+                cache_dir=os.path.join(cache_dir, f"samples_{i}-{i+batch_size}") if cache_dir is not None else None,
+                prompt_key_mask=prompt_key_mask,
+                attention_pattern_multiplier=attention_pattern_multiplier,
+                attention_mask=attention_mask,
+            )
+        elif prompt_key_mask is not None and attention_pattern_multiplier is not None:
+            generation = _generate_with_hooks(
+                model,
+                toks,
+                max_tokens_generated=max_tokens_generated,
+                fwd_hooks=[],
+                cache_dir=os.path.join(cache_dir, f"samples_{i}-{i+batch_size}") if cache_dir is not None else None,
+                prompt_key_mask=prompt_key_mask,
+                attention_pattern_multiplier=attention_pattern_multiplier,
+                attention_mask=attention_mask,
             )
         else:
             generation = _generate_without_hooks(
