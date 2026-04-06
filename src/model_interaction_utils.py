@@ -15,6 +15,16 @@ from transformer_lens.past_key_value_caching import HookedTransformerKeyValueCac
 from transformers import AutoTokenizer
 
 
+def _normalize_instruction_messages(instruction):
+    if isinstance(instruction, list):
+        if not all(isinstance(message, dict) for message in instruction):
+            raise TypeError("Chat instructions must be lists of message dicts")
+        return instruction
+    if isinstance(instruction, str):
+        return [{"role": "user", "content": instruction}]
+    raise TypeError(f"Unsupported instruction type: {type(instruction)!r}")
+
+
 def _get_stop_token_ids(model: HookedTransformer) -> set[int]:
     stop_token_ids = getattr(model, "generation_stop_token_ids", None)
     if stop_token_ids is None:
@@ -31,7 +41,7 @@ def _parse_gpt_oss_final_response(text: str) -> str:
         flags=re.DOTALL,
     )
     if matches:
-        return matches[-1].strip()
+        return matches[0].strip()
 
     commentary_matches = re.findall(
         r"<\|channel\|>commentary<\|message\|>(.*?)(?:<\|end\|>|<\|return\|>|<\|start\|>|$)",
@@ -39,10 +49,50 @@ def _parse_gpt_oss_final_response(text: str) -> str:
         flags=re.DOTALL,
     )
     if commentary_matches:
-        return commentary_matches[-1].strip()
+        return commentary_matches[0].strip()
 
     cleaned = re.sub(r"<\|[^>]+\|>", "", text)
     return cleaned.strip()
+
+
+def _is_probably_degenerate_gpt_oss_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if "<|" in stripped:
+        return True
+    if stripped.count("?") >= 4:
+        return True
+    if stripped.startswith(("The user", "The correct", "Chat")):
+        return True
+    if stripped in {"The", "We", "Ok?", "The?", "We?"}:
+        return True
+    nonspace = sum(not ch.isspace() for ch in stripped)
+    alpha = sum(ch.isalpha() for ch in stripped)
+    weird = sum(ch in "?*#[]{}|<>…" for ch in stripped)
+    if nonspace >= 8 and alpha / max(nonspace, 1) < 0.35 and weird >= 2:
+        return True
+    if stripped.startswith(("**", "##", "|")) and alpha / max(nonspace, 1) < 0.45:
+        return True
+    return False
+
+
+def _truncate_gpt_oss_degenerate_tail(text: str) -> str:
+    lines = text.splitlines()
+    if not lines:
+        return text.strip()
+
+    kept_lines = []
+    content_chars = 0
+    for line in lines:
+        stripped = line.strip()
+        if content_chars >= 120 and _is_probably_degenerate_gpt_oss_line(stripped):
+            break
+        kept_lines.append(line)
+        if stripped:
+            content_chars += len(stripped)
+
+    return "\n".join(kept_lines).strip()
 
 
 def _decode_generated_tokens(model: HookedTransformer, generated_tokens: List[torch.Tensor]) -> List[str]:
@@ -51,7 +101,7 @@ def _decode_generated_tokens(model: HookedTransformer, generated_tokens: List[to
             model.tokenizer.decode(tokens, skip_special_tokens=False)
             for tokens in generated_tokens
         ]
-        return [_parse_gpt_oss_final_response(text) for text in decoded]
+        return [_truncate_gpt_oss_degenerate_tail(_parse_gpt_oss_final_response(text)) for text in decoded]
     return model.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
 
 def tokenize_instructions(
@@ -63,9 +113,6 @@ def tokenize_instructions(
     reasoning_effort: str | None = None,
     enable_thinking: bool | None = None,
 ) -> Int[Tensor, 'batch_size seq_len']:
-    # Convert each instruction into a chat message format
-    messages = [{"role": "user", "content": instruction} for instruction in instructions]
-    
     # Apply the chat template using the tokenizer's built-in method
     if apply_chat_template and hasattr(tokenizer, "apply_chat_template"):
         chat_template_kwargs = {
@@ -77,13 +124,19 @@ def tokenize_instructions(
         if enable_thinking is not None:
             chat_template_kwargs["enable_thinking"] = enable_thinking
         formatted_instructions = [
-            tokenizer.apply_chat_template([msg], **chat_template_kwargs)
-            for msg in messages
+            tokenizer.apply_chat_template(
+                _normalize_instruction_messages(instruction),
+                **chat_template_kwargs,
+            )
+            for instruction in instructions
         ]
         add_special_tokens = False
     else:
         print(f"Either apply_chat_template set to False or no chat template available. Using basic tokenization.")
-        formatted_instructions = [msg["content"] for msg in messages]
+        formatted_instructions = [
+            instruction if isinstance(instruction, str) else instruction[-1]["content"]
+            for instruction in instructions
+        ]
         add_special_tokens = True
 
     return tokenizer(formatted_instructions, padding=True, return_tensors="pt", add_special_tokens=add_special_tokens).input_ids
@@ -97,9 +150,6 @@ def tokenize_instructions_harmful(
     reasoning_effort: str | None = None,
     enable_thinking: bool | None = None,
 ) -> Int[Tensor, 'batch_size seq_len']:
-    # Convert each instruction into a chat message format
-    messages = [{"role": "user", "content": instruction} for instruction in instructions]
-    
     # Apply the chat template using the tokenizer's built-in method
     if apply_chat_template and hasattr(tokenizer, "apply_chat_template"):
         chat_template_kwargs = {
@@ -111,12 +161,18 @@ def tokenize_instructions_harmful(
         if enable_thinking is not None:
             chat_template_kwargs["enable_thinking"] = enable_thinking
         formatted_instructions = [
-            tokenizer.apply_chat_template([msg], **chat_template_kwargs) + "Sure,"
-            for msg in messages
+            tokenizer.apply_chat_template(
+                _normalize_instruction_messages(instruction),
+                **chat_template_kwargs,
+            ) + "Sure,"
+            for instruction in instructions
         ]
     else:
         print(f"Either apply_chat_template set to False or no chat template available. Using basic tokenization.")
-        formatted_instructions = [msg["content"] for msg in messages]
+        formatted_instructions = [
+            instruction if isinstance(instruction, str) else instruction[-1]["content"]
+            for instruction in instructions
+        ]
     
     return tokenizer(formatted_instructions, padding=True, return_tensors="pt", add_special_tokens=False).input_ids
 

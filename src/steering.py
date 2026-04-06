@@ -221,7 +221,8 @@ if __name__ == "__main__":
             trust_remote_code=trust_remote_code,
         )
 
-    model.tokenizer.pad_token = model.tokenizer.eos_token
+    if MODEL_PATH != "openai/gpt-oss-20b" and model.tokenizer.pad_token is None:
+        model.tokenizer.pad_token = model.tokenizer.eos_token
 
     tokenize_instructions_fn = functools.partial(
         tokenize_instructions,
