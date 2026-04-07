@@ -39,6 +39,7 @@ DATASET_SELECTORS="all emotions ai-risk-mcq ai-risk-qa triviaqa truthfulqa safet
 MAX_TOKENS_ARGS=
 REASONING_ARGS=
 THINKING_ARGS=
+FAILED_CASES=
 
 if [ -z "$BATCH_SIZE" ]; then
     case "$MODEL" in
@@ -113,7 +114,7 @@ run_case() {
         return
     fi
 
-    python src/steering.py \
+    if python src/steering.py \
         --dataset "$DATASET" \
         --dataset_dir "$DATASET_DIR" \
         --output_dir "$OUTPUT_DIR" \
@@ -128,19 +129,29 @@ run_case() {
         $REASONING_ARGS \
         $THINKING_ARGS \
         >"$LOG_FILE" 2>&1
-
-    echo "Finished ${CASE_LABEL}"
-    echo "Log: $LOG_FILE"
-    echo "Model: $MODEL"
-    echo "Batch size: $BATCH_SIZE"
-    if [ -n "${MAX_TOKENS_GENERATED:-}" ]; then
-        echo "Max tokens generated: $MAX_TOKENS_GENERATED"
-    fi
-    if [ -n "${REASONING_EFFORT:-}" ]; then
-        echo "Reasoning effort: $REASONING_EFFORT"
-    fi
-    if [ -n "${THINKING_MODE:-}" ]; then
-        echo "Thinking mode: $THINKING_MODE"
+    then
+        echo "Finished ${CASE_LABEL}"
+        echo "Log: $LOG_FILE"
+        echo "Model: $MODEL"
+        echo "Batch size: $BATCH_SIZE"
+        if [ -n "${MAX_TOKENS_GENERATED:-}" ]; then
+            echo "Max tokens generated: $MAX_TOKENS_GENERATED"
+        fi
+        if [ -n "${REASONING_EFFORT:-}" ]; then
+            echo "Reasoning effort: $REASONING_EFFORT"
+        fi
+        if [ -n "${THINKING_MODE:-}" ]; then
+            echo "Thinking mode: $THINKING_MODE"
+        fi
+    else
+        echo "Failed ${CASE_LABEL} for ${MODEL}"
+        echo "Log: $LOG_FILE"
+        if [ -n "$FAILED_CASES" ]; then
+            FAILED_CASES="${FAILED_CASES}
+${CASE_LABEL}: ${LOG_FILE}"
+        else
+            FAILED_CASES="${CASE_LABEL}: ${LOG_FILE}"
+        fi
     fi
 }
 
@@ -272,3 +283,9 @@ case "$SELECTOR" in
         exit 1
         ;;
 esac
+
+if [ -n "$FAILED_CASES" ]; then
+    echo "One or more runs failed:"
+    printf '%s\n' "$FAILED_CASES"
+    exit 1
+fi
