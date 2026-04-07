@@ -32,6 +32,7 @@ BATCH_SIZE=${3:-${BATCH_SIZE:-}}
 MAX_TOKENS_GENERATED=${4:-${MAX_TOKENS_GENERATED:-}}
 REASONING_EFFORT=${5:-${REASONING_EFFORT:-}}
 THINKING_MODE=${6:-${THINKING_MODE:-}}
+METHODS_SELECTOR=${7:-${METHODS:-}}
 
 EMOTIONS="anger disgust fear joy sadness surprise"
 AI_RISK_BEHAVIORS="power wealth"
@@ -40,6 +41,8 @@ MAX_TOKENS_ARGS=
 REASONING_ARGS=
 THINKING_ARGS=
 FAILED_CASES=
+METHODS_ARGS=
+DEFAULT_METHODS="prompt prompt-attention spotlight"
 
 if [ -z "$BATCH_SIZE" ]; then
     case "$MODEL" in
@@ -97,6 +100,13 @@ case "${THINKING_MODE:-}" in
         ;;
 esac
 
+if [ -z "${METHODS_SELECTOR:-}" ]; then
+    METHODS_SELECTOR=$DEFAULT_METHODS
+fi
+
+METHODS_NORMALIZED=$(printf '%s' "$METHODS_SELECTOR" | tr ',' ' ')
+METHODS_ARGS="--methods $METHODS_NORMALIZED"
+
 run_case() {
     CASE_LABEL=$1
     DATASET=$2
@@ -109,7 +119,15 @@ run_case() {
 
     mkdir -p "$LOG_DIR"
 
-    if [ -f "$RESULTS_FILE" ]; then
+    ALL_METHOD_RESULTS_PRESENT=1
+    for METHOD in $METHODS_NORMALIZED; do
+        if [ ! -f "${OUTPUT_DIR}/${MODEL_SHORT}/${METHOD}/results.json" ]; then
+            ALL_METHOD_RESULTS_PRESENT=0
+            break
+        fi
+    done
+
+    if [ "$ALL_METHOD_RESULTS_PRESENT" -eq 1 ] && [ -f "$RESULTS_FILE" ]; then
         echo "Skipping ${CASE_LABEL} for ${MODEL}: found existing results at ${RESULTS_FILE}"
         return
     fi
@@ -124,7 +142,7 @@ run_case() {
         --use_fluency \
         --normalize_dir \
         --trust_remote_code \
-        --methods prompt prompt-attention \
+        $METHODS_ARGS \
         $MAX_TOKENS_ARGS \
         $REASONING_ARGS \
         $THINKING_ARGS \

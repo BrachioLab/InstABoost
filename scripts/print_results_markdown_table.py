@@ -8,6 +8,7 @@ PREFERRED_METHOD_ORDER = [
     "baseline",
     "prompt",
     "prompt-attention",
+    "spotlight",
     "refusal",
     "random",
     "mean",

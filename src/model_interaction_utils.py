@@ -191,6 +191,43 @@ def prompt_attention_ablation_hook(
     scaled_pattern = scaled_pattern / safe_denominator
     return scaled_pattern * original_visible_mass
 
+
+def spotlight_attn_scores_hook(
+    attn_scores: torch.Tensor,
+    hook: HookPoint,
+    prompt_key_mask: torch.Tensor,
+    target_attention: float,
+):
+    if target_attention <= 0:
+        return attn_scores
+
+    mask = prompt_key_mask.to(device=attn_scores.device, dtype=attn_scores.dtype)
+    if mask.shape[-1] < attn_scores.shape[-1]:
+        pad_width = attn_scores.shape[-1] - mask.shape[-1]
+        mask = torch.nn.functional.pad(mask, (0, pad_width))
+    elif mask.shape[-1] > attn_scores.shape[-1]:
+        mask = mask[:, :attn_scores.shape[-1]]
+
+    if not mask.any():
+        return attn_scores
+
+    attn_scores_float = attn_scores.to(torch.float32)
+    mask_float = mask.to(torch.float32)
+    attn_probs = attn_scores_float.softmax(dim=-1)
+    current_attn = (attn_probs * mask_float[:, None, None, :]).sum(dim=-1)
+    proportion = current_attn.clamp(min=0.0, max=1.0)
+    boost_needed = proportion < target_attention
+
+    if not boost_needed.any():
+        return attn_scores
+
+    bias = torch.zeros_like(proportion)
+    bias[boost_needed] = torch.log(
+        torch.full_like(proportion[boost_needed], target_attention) / (proportion[boost_needed] + 1e-8)
+    )
+    updated_scores = attn_scores_float + bias.unsqueeze(-1) * mask_float[:, None, None, :]
+    return updated_scores.to(attn_scores.dtype)
+
 def tokenize_instructions(
     tokenizer: AutoTokenizer,
     instructions: List[str],
@@ -289,6 +326,7 @@ def _generate_with_hooks(
     cache_dir: str = None,
     prompt_key_mask: torch.Tensor | None = None,
     attention_pattern_multiplier: float | None = None,
+    spotlight_target_attention: float | None = None,
     attention_mask: torch.Tensor | None = None,
 ) -> List[str]:
     device = model.cfg.device
@@ -324,6 +362,16 @@ def _generate_with_hooks(
             )
             current_hooks = current_hooks + [
                 (utils.get_act_name("pattern", layer), prompt_attention_hook)
+                for layer in range(model.cfg.n_layers)
+            ]
+        if prompt_key_mask is not None and spotlight_target_attention is not None:
+            spotlight_hook = functools.partial(
+                spotlight_attn_scores_hook,
+                prompt_key_mask=prompt_key_mask,
+                target_attention=spotlight_target_attention,
+            )
+            current_hooks = current_hooks + [
+                (utils.get_act_name("attn_scores", layer), spotlight_hook)
                 for layer in range(model.cfg.n_layers)
             ]
 
@@ -421,7 +469,11 @@ def get_generations(
     cache_dir: str = None,
     prompt_spans: List[Tuple[int, int, int]] | None = None,
     attention_pattern_multiplier: float | None = None,
+    spotlight_target_attention: float | None = None,
 ) -> List[str]:
+
+    if attention_pattern_multiplier is not None and spotlight_target_attention is not None:
+        raise ValueError("Prompt-attention and spotlight interventions cannot be applied at the same time")
 
     # assert batch_size == 1, "Batch size must be 1 for now"
     generations = []
@@ -429,7 +481,9 @@ def get_generations(
     for i in tqdm(range(0, len(instructions), batch_size), desc="Generating completions"):
         #print("Prompt:", instructions[i])
         need_attention_mask = bool(fwd_hooks) or (
-            prompt_spans is not None and attention_pattern_multiplier is not None
+            prompt_spans is not None and (
+                attention_pattern_multiplier is not None or spotlight_target_attention is not None
+            )
         )
         if need_attention_mask:
             toks, attention_mask = tokenize_instructions_fn(
@@ -455,9 +509,12 @@ def get_generations(
                 cache_dir=os.path.join(cache_dir, f"samples_{i}-{i+batch_size}") if cache_dir is not None else None,
                 prompt_key_mask=prompt_key_mask,
                 attention_pattern_multiplier=attention_pattern_multiplier,
+                spotlight_target_attention=spotlight_target_attention,
                 attention_mask=attention_mask,
             )
-        elif prompt_key_mask is not None and attention_pattern_multiplier is not None:
+        elif prompt_key_mask is not None and (
+            attention_pattern_multiplier is not None or spotlight_target_attention is not None
+        ):
             generation = _generate_with_hooks(
                 model,
                 toks,
@@ -466,6 +523,7 @@ def get_generations(
                 cache_dir=os.path.join(cache_dir, f"samples_{i}-{i+batch_size}") if cache_dir is not None else None,
                 prompt_key_mask=prompt_key_mask,
                 attention_pattern_multiplier=attention_pattern_multiplier,
+                spotlight_target_attention=spotlight_target_attention,
                 attention_mask=attention_mask,
             )
         else:

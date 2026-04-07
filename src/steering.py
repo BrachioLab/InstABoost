@@ -48,6 +48,7 @@ from model_interaction_utils import (
 from evaluation_utils import evaluate_generations, load_existing_results, save_all_methods_results, run_evaluation_pipeline, print_evaluation_results
 
 STEERING_FACTORS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+SPOTLIGHT_TARGET_ATTENTIONS = [0.1, 0.15, 0.2, 0.25, 0.3]
 
 def direction_ablation_hook(
     activation: Float[Tensor, "... d_act"],
@@ -65,6 +66,22 @@ def in_direction_ablation_hook(
 ):
     direction = direction.to(activation.device)
     return activation + multiplier * direction.unsqueeze(0)
+
+
+def merge_existing_all_methods_results(output_dir: str, model_short: str, all_methods_results: dict, method_times: dict):
+    aggregate_path = os.path.join(output_dir, model_short, "all_methods_results.json")
+    if not os.path.exists(aggregate_path):
+        return all_methods_results, method_times
+
+    with open(aggregate_path, "r") as f:
+        existing_payload = json.load(f)
+
+    merged_methods = dict(existing_payload.get("methods", {}))
+    merged_methods.update(all_methods_results)
+
+    merged_times = dict(existing_payload.get("method_times", {}))
+    merged_times.update(method_times)
+    return merged_methods, merged_times
 
 def get_prompt_span(full_instruction, base_instruction, tokenize_instructions_fn) -> tuple[int, int, int]:
     full_tokens = tokenize_instructions_fn(instructions=[full_instruction])[0].tolist()
@@ -134,6 +151,8 @@ def get_steering_direction(harmful_hiddens, harmless_hiddens, steering_type="mea
         dir = None
     elif steering_type == "prompt-attention":
         dir = None
+    elif steering_type == "spotlight":
+        dir = None
     else:
         raise ValueError(f"Unknown steering type: {steering_type}")
 
@@ -165,7 +184,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_tokens_generated", type=int, default=None, help="Override the dataset default max generated tokens")
     parser.add_argument("--model_n_layers", type=int, default=None, help="Override the number of transformer layers loaded for models that support partial loading.")
     # Steering arguments
-    parser.add_argument("--steering_type", type=str, default="refusal", choices=["refusal", "random", "mean", "prompt", "pca", "repe", "linear", "prompt-attention"], help="Type of steering to perform")
+    parser.add_argument("--steering_type", type=str, default="refusal", choices=["refusal", "random", "mean", "prompt", "pca", "repe", "linear", "prompt-attention", "spotlight"], help="Type of steering to perform")
     parser.add_argument("--steer_to_pt", action="store_true", help="Steer to PT (defaults to CT)")
     parser.add_argument("--cache_harmless", action="store_true", help="Cache harmless instructions. By default, only harmful instructions are cached.")
     # Misc arguments
@@ -203,7 +222,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--methods",
         nargs="+",
-        choices=["prompt", "prompt-attention", "refusal", "random", "mean", "pca", "repe", "linear"],
+        choices=["prompt", "prompt-attention", "spotlight", "refusal", "random", "mean", "pca", "repe", "linear"],
         default=None,
         help="Subset of steering methods to run. Baseline always runs for comparison."
     )
@@ -301,6 +320,7 @@ if __name__ == "__main__":
     selected_methods = set(args.methods) if args.methods is not None else {
         "prompt",
         "prompt-attention",
+        "spotlight",
         "refusal",
         "random",
         "mean",
@@ -516,7 +536,128 @@ if __name__ == "__main__":
         print(50*'-', '\n\n')
         all_methods_results["prompt-attention"] = prompt_attention_results
 
-    # 5. Run other steering methods
+    # 5. Run spotlight method
+    if "spotlight" in selected_methods:
+        spotlight_start = time.time()
+        print("\nRunning spotlight method")
+        print(50*'-')
+        spotlight_output_dir = os.path.join(args.output_dir, f"{MODEL_PATH.split('/')[1]}", "spotlight")
+        os.makedirs(spotlight_output_dir, exist_ok=True)
+
+        spotlight_results, spotlight_generations = load_existing_results(spotlight_output_dir, "results")
+        if spotlight_results is None:
+            print("Running spotlight evaluation")
+            val_prompt_spans = get_prompt_spans(steer_prompt, steer_val_dataset, tokenize_instructions_fn)
+            prompt_spans = get_prompt_spans(steer_prompt, steer_dataset, tokenize_instructions_fn)
+            example_prompt_span = val_prompt_spans[0]
+            print(f"Prompt span example (start, end, full_len): {example_prompt_span}")
+
+            best_target_attention_path = os.path.join(spotlight_output_dir, "best_target_attention.txt")
+            if os.path.exists(best_target_attention_path):
+                with open(best_target_attention_path, "r") as f:
+                    best_target_attention = float(f.read())
+            else:
+                steering_success_rates = []
+                fluencies = []
+                checked_attentions = []
+                validation_examples = {}
+                for target_attention in SPOTLIGHT_TARGET_ATTENTIONS:
+                    print(f"Testing target attention: {target_attention}")
+                    checked_attentions.append(target_attention)
+
+                    val_steer_generations = get_generations(
+                        model,
+                        [apply_steer_prompt(sample, steer_prompt) for sample in steer_val_dataset],
+                        tokenize_instructions_fn,
+                        fwd_hooks=[],
+                        max_tokens_generated=max_tokens_generated,
+                        batch_size=batch_size,
+                        prompt_spans=val_prompt_spans,
+                        spotlight_target_attention=target_attention,
+                    )
+
+                    val_results = evaluate_generations(
+                        generations=val_steer_generations,
+                        dataset=dataset,
+                        eval_type=eval_type,
+                        eval_args=eval_args,
+                        questions=steer_val_questions,
+                        answers=steer_val_answers,
+                        alt_answers=steer_val_alt_answers,
+                        is_validation=True,
+                        use_fluency=args.use_fluency,
+                        steer_dataset=steer_val_dataset
+                    )
+
+                    steering_success_rates.append(val_results["score"])
+                    if args.use_fluency:
+                        fluencies.append(val_results["fluency"])
+                        print(f"Fluency: {val_results['fluency']}")
+                        if val_results["fluency"] < 1:
+                            print(f"Fluency: {val_results['fluency']} < 1, ending search")
+                            break
+
+                    validation_examples[str(target_attention)] = []
+                    for i in range(len(val_steer_generations)):
+                        example = {
+                            "sample": steer_val_dataset[i],
+                            "generation": val_steer_generations[i],
+                            "score": val_results["per_sample"][i]["score"],
+                            "fluency": val_results["per_sample"][i]["fluency"] if args.use_fluency else None,
+                        }
+                        validation_examples[str(target_attention)].append(example)
+
+                    print(f"Score: {val_results['score']}")
+                    print(50*'-')
+
+                with open(os.path.join(spotlight_output_dir, "validation_examples.json"), "w") as f:
+                    json.dump(validation_examples, f, indent=2)
+
+                steering_success_rates = np.array(steering_success_rates)
+                fluencies = np.array(fluencies) if args.use_fluency else None
+                with open(os.path.join(spotlight_output_dir, "acc_fluency.txt"), "w") as f:
+                    for i in range(len(steering_success_rates)):
+                        if args.use_fluency:
+                            f.write(f"{checked_attentions[i]}, {steering_success_rates[i]}, {fluencies[i]}\n")
+                        else:
+                            f.write(f"{checked_attentions[i]}, {steering_success_rates[i]}\n")
+                if args.use_fluency:
+                    steering_success_rates[fluencies < 1] = -1
+                best_target_attention = checked_attentions[np.argmax(steering_success_rates)]
+                print(f"Best target attention: {best_target_attention}")
+                with open(best_target_attention_path, "w") as f:
+                    f.write(f"{best_target_attention}")
+
+            spotlight_results, spotlight_generations = run_evaluation_pipeline(
+                model=model,
+                dataset=dataset,
+                eval_type=eval_type,
+                eval_args=eval_args,
+                steer_dataset=steer_dataset,
+                steer_questions=steer_questions,
+                steer_answers=steer_answers,
+                steer_alt_answers=steer_alt_answers,
+                tokenize_instructions_fn=tokenize_instructions_fn,
+                fwd_hooks=[],
+                steer_prompt=steer_prompt,
+                max_tokens_generated=max_tokens_generated,
+                batch_size=batch_size,
+                use_fluency=args.use_fluency,
+                output_dir=spotlight_output_dir,
+                baseline_results=baseline_results,
+                baseline_generations=baseline_generations,
+                best_factor=best_target_attention,
+                prompt_spans=prompt_spans,
+                spotlight_target_attention=best_target_attention,
+            )
+        spotlight_time = time.time() - spotlight_start
+        method_times["spotlight"] = spotlight_time
+        print_evaluation_results(spotlight_results, prefix="spotlight", use_fluency=args.use_fluency)
+        print(f"Spotlight method took {spotlight_time:.2f} seconds")
+        print(50*'-', '\n\n')
+        all_methods_results["spotlight"] = spotlight_results
+
+    # 6. Run other steering methods
     other_methods = [method for method in ["refusal", "random", "mean", "pca", "repe", "linear"] if method in selected_methods]
     
     # Dictionary to store validation results for each method
@@ -764,7 +905,13 @@ if __name__ == "__main__":
         
         print(f"{steering_type} method took {method_time:.2f} seconds")
 
-    # 6. Save all results
+    # 7. Save all results
+    all_methods_results, method_times = merge_existing_all_methods_results(
+        args.output_dir,
+        MODEL_PATH.split("/")[1],
+        all_methods_results,
+        method_times,
+    )
     save_all_methods_results(
         output_dir=args.output_dir,
         model_name=MODEL_PATH.split('/')[1],

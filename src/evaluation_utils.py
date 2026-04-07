@@ -372,6 +372,7 @@ def run_evaluation_pipeline(
     baseline_generations: Optional[List[str]] = None,
     prompt_spans: Optional[List[Tuple[int, int, int]]] = None,
     attention_pattern_multiplier: Optional[float] = None,
+    spotlight_target_attention: Optional[float] = None,
 ) -> Tuple[Dict[str, Any], List[str]]:
     """
     Run the complete evaluation pipeline including generation, evaluation, and saving results.
@@ -412,6 +413,7 @@ def run_evaluation_pipeline(
         cache_dir=cache_dir,
         prompt_spans=prompt_spans,
         attention_pattern_multiplier=attention_pattern_multiplier,
+        spotlight_target_attention=spotlight_target_attention,
     )
     
     # Evaluate generations
