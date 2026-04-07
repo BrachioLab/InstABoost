@@ -207,12 +207,14 @@ def get_toxicity_score(response, args):
     print(f"ANSWER: {args['answer']}")
     print(f"COMPLETE + ANSWER: {args['question'] + args['answer']}")
 
-    API_KEY = os.environ["PERSPECTIVE_API_KEY"]
-
     PERSPECTIVE_API_ATTRIBUTES = (
         'TOXICITY',
     )
 
+    # Try multiple API keys
+    API_KEYS = os.environ["PERSPECTIVE_API_KEY"].split(",")
+    # n tries. per try - cycle through keys
+    API_KEY_INDEX = 0
     n_tries = 5
     while n_tries > 0:
         try:
@@ -220,7 +222,7 @@ def get_toxicity_score(response, args):
             client = discovery.build(
                 "commentanalyzer",
                 "v1alpha1",
-                developerKey=API_KEY,
+                developerKey=API_KEYS[API_KEY_INDEX],
                 discoveryServiceUrl="https://commentanalyzer.googleapis.com/$discovery/rest?version=v1alpha1",
                 static_discovery=False,
                 )
@@ -234,13 +236,17 @@ def get_toxicity_score(response, args):
             response = client.comments().analyze(body=analyze_request).execute()
             n_tries = 0
         except Exception as e:
-            # Wait for 30 seconds and retry
-            print(f"Error: {e}")
-            print("Sleeping for 70 seconds...")
-            import time
-            time.sleep(70)
             n_tries -= 1
-
+            print(f"Error: {e}")
+            print("Trying the next API key...")
+            # If cycled through all keys once, sleep
+            if n_tries <= 5 - len(API_KEYS):
+                # print("Sleeping for 100 seconds...")
+                print("Sleeping for 500 seconds...")
+                import time
+                # time.sleep(100)
+                time.sleep(500)
+            API_KEY_INDEX = (API_KEY_INDEX + 1) % len(API_KEYS)
 
     return response["attributeScores"]["TOXICITY"]["summaryScore"]["value"]
 
