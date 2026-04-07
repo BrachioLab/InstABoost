@@ -5,7 +5,7 @@ from prompts import EVAL_STRATEGY
 from typing import List, Dict, Tuple, Optional, Any
 import random
 from scipy import stats
-from model_interaction_utils import get_generations
+from model_interaction_utils import apply_steer_prompt, get_generations
 
 def load_existing_results(output_dir, results_name):
     """
@@ -404,7 +404,7 @@ def run_evaluation_pipeline(
     # Generate completions
     generations = get_generations(
         model,
-        [steer_prompt + sample for sample in steer_dataset],
+        [apply_steer_prompt(sample, steer_prompt) for sample in steer_dataset],
         tokenize_instructions_fn,
         fwd_hooks=fwd_hooks,
         max_tokens_generated=max_tokens_generated,

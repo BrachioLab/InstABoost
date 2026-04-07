@@ -2,7 +2,7 @@ import os
 import gc
 import re
 import functools
-from typing import List, Callable, Tuple
+from typing import Any, List, Callable, Tuple
 
 import torch
 from torch import Tensor
@@ -23,6 +23,25 @@ def _normalize_instruction_messages(instruction):
         return instruction
     if isinstance(instruction, str):
         return [{"role": "user", "content": instruction}]
+    raise TypeError(f"Unsupported instruction type: {type(instruction)!r}")
+
+
+def apply_steer_prompt(instruction: Any, steer_prompt: str):
+    if not steer_prompt:
+        return instruction
+    if isinstance(instruction, str):
+        return steer_prompt + instruction
+    if isinstance(instruction, list):
+        normalized_messages = _normalize_instruction_messages(instruction)
+        updated_messages = [dict(message) for message in normalized_messages]
+        for message in updated_messages:
+            if message.get("role") == "user":
+                message["content"] = steer_prompt + message["content"]
+                return updated_messages
+        if not updated_messages:
+            raise ValueError("Chat instructions cannot be empty")
+        updated_messages[0]["content"] = steer_prompt + updated_messages[0]["content"]
+        return updated_messages
     raise TypeError(f"Unsupported instruction type: {type(instruction)!r}")
 
 

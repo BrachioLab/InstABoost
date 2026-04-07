@@ -40,6 +40,7 @@ from data_utils import (
 )
 from prompts import PROMPTS, EVAL_STRATEGY
 from model_interaction_utils import (
+    apply_steer_prompt,
     tokenize_instructions,
     get_generations,
     get_hiddens
@@ -65,7 +66,7 @@ def in_direction_ablation_hook(
     direction = direction.to(activation.device)
     return activation + multiplier * direction.unsqueeze(0)
 
-def get_prompt_span(full_instruction: str, base_instruction: str, tokenize_instructions_fn) -> tuple[int, int, int]:
+def get_prompt_span(full_instruction, base_instruction, tokenize_instructions_fn) -> tuple[int, int, int]:
     full_tokens = tokenize_instructions_fn(instructions=[full_instruction])[0].tolist()
     base_tokens = tokenize_instructions_fn(instructions=[base_instruction])[0].tolist()
 
@@ -91,11 +92,11 @@ def get_prompt_span(full_instruction: str, base_instruction: str, tokenize_instr
     return prefix_len, full_end, len(full_tokens)
 
 
-def get_prompt_spans(steer_prompt: str, samples: list[str], tokenize_instructions_fn) -> list[tuple[int, int, int]]:
+def get_prompt_spans(steer_prompt: str, samples, tokenize_instructions_fn) -> list[tuple[int, int, int]]:
     if not steer_prompt:
         raise ValueError("Prompt-attention requires a non-empty steer_prompt")
     return [
-        get_prompt_span(steer_prompt + sample, sample, tokenize_instructions_fn)
+        get_prompt_span(apply_steer_prompt(sample, steer_prompt), sample, tokenize_instructions_fn)
         for sample in samples
     ]
 
@@ -424,7 +425,7 @@ if __name__ == "__main__":
 
                     val_steer_generations = get_generations(
                         model,
-                        [steer_prompt + sample for sample in steer_val_dataset],
+                        [apply_steer_prompt(sample, steer_prompt) for sample in steer_val_dataset],
                         tokenize_instructions_fn,
                         fwd_hooks=[],
                         max_tokens_generated=max_tokens_generated,
