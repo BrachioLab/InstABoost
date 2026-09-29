@@ -1,0 +1,9 @@
+{
+  "reasoner_types": ["learned"],
+  "train_seeds": [601],
+  "nd_pairs": [[64, 128]],
+  "num_reasoner_steps": 3,
+  "eval_seed": 0,
+  "num_samples": 512,
+  "batch_size": 256
+}

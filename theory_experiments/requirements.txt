@@ -1,0 +1,13 @@
+# Supplements the parent tf_logic requirements.txt -- it does not replace it.
+#
+# The parent pins transformers==4.40.2, which CANNOT run the runners in this directory.
+# `RuleBiasAutoregWrapper` passes a 4-D (batch, 1, seq, seq) attention mask so it can add a
+# per-key bias to the rulebook rows. GPT2Model only gained 4-D mask support in 4.52; before
+# that its forward does `attention_mask.view(batch_size, -1)`, flattening the mask to
+# (batch, seq*seq), and every run dies with:
+#     RuntimeError: The size of tensor a (L) must match the size of tensor b (L*L)
+#                   at non-singleton dimension 3
+#
+# Verified end-to-end: 4.52.4 and 4.53.2 work; 4.40.2, 4.44.2, 4.49.0 and 4.50.3 fail.
+# Results currently in results/ were produced with 4.53.2.
+transformers>=4.52

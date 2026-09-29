@@ -1,0 +1,33 @@
+{
+  "attack_name": "coerce_state",
+  "reasoner_types": [
+    "learned"
+  ],
+  "train_seeds": [
+    601
+  ],
+  "nd_pairs": [
+    [
+      64,
+      128
+    ]
+  ],
+  "num_reasoner_steps": 3,
+  "num_attack_tokens": [
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34
+  ],
+  "attn_bias_values": [
+    2.5
+  ],
+  "num_samples": 16384,
+  "batch_size": 512,
+  "num_deltas": 1024,
+  "num_x0_per_delta": 512
+}
